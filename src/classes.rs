@@ -438,7 +438,7 @@ fn decompile_class_impl(
         // synth bridge ctor, the implicit super(name,ordinal), and the
         // enum-const-population <clinit> body). No-op on non-enum
         // classes.
-        let enum_ctx = EnumCtx::build(dex, class_def, &cd.static_fields);
+        let mut enum_ctx = EnumCtx::build(dex, class_def, &cd.static_fields);
 
         // For canonical enum classes, attempt to extract per-constant
         // constructor user-args from the `<clinit>` body. On success we
@@ -469,6 +469,27 @@ fn decompile_class_impl(
         } else {
             BTreeSet::new()
         };
+
+        // Suppression rows 1-7 and the enum-constructor parameter
+        // stripping are only correct once the canonical `NAME(args),`
+        // render above succeeded: they elide the members javac
+        // synthesises, which those inline declarations stand in for.
+        // When the recogniser bails — e.g. R8 builds the `$VALUES`
+        // array inline instead of calling `$values()`, so the
+        // invariant check at the end of
+        // `scan_enum_clinit_pops_with_user_args` fails — the
+        // fall-through render still emits the static block and the
+        // static-final ACC_ENUM fields, so suppression must be off as
+        // well. Otherwise the class renders a zero-argument
+        // constructor whose body has had `super(name, ordinal)`
+        // stripped, while the `static {}` block calls that constructor
+        // with two arguments: uncompilable, and the missing
+        // `values()` / `valueOf(String)` / `$VALUES` are dropped for a
+        // class that never got the inline declarations that replace
+        // them.
+        if enum_constant_emitted.is_empty() {
+            enum_ctx.applies = false;
+        }
 
         // Fields. Suppressed in facade mode: instance_fields is empty
         // by structural-gate construction; static_fields would be
@@ -1068,7 +1089,17 @@ fn emit_methods(
             continue;
         }
 
-        match decompile_method(dex, data, em, class_def, imports, is_kt_facade, trace, r8_census) {
+        match decompile_method(
+            dex,
+            data,
+            em,
+            class_def,
+            imports,
+            is_kt_facade,
+            trace,
+            r8_census,
+            enum_ctx.applies,
+        ) {
             Ok(source) => {
                 // Row 7 (v2 matrix): in an enum ctor, strip the implicit
                 // `super(name, ordinal)` call — javac re-inserts it
@@ -1335,6 +1366,7 @@ fn decompile_method(
     is_kt_facade: bool,
     trace: Trace,
     r8_census: &r8_inversion::TrampolineCensus,
+    enum_canonical: bool,
 ) -> Result<String, DexError> {
     let class_desc = dex.get_type_descriptor(class_def.class_idx).unwrap_or("L?;");
     let method_name = dex
@@ -1497,7 +1529,14 @@ fn decompile_method(
     // must be preserved so emit_method's existing v0 → `this` receiver
     // rename keeps working. params[1] and params[2] are the synthetics;
     // drop those and keep `this` plus the user args (params[3..]).
-    let is_enum_ctor = raw_name == "<init>"
+    // Only strip the synthetic `(String name, int ordinal)` pair when
+    // the canonical `NAME(args),` render actually claimed this enum:
+    // the fall-through render prints the constructor verbatim (and
+    // keeps its implicit `super(name, ordinal)` call), so dropping the
+    // parameters there would leave the `static {}` block calling a
+    // zero-argument prototype with two arguments.
+    let is_enum_ctor = enum_canonical
+        && raw_name == "<init>"
         && (class_def.access_flags & 0x4000 != 0)
         && class_def
             .superclass_idx
@@ -3288,7 +3327,17 @@ fn extract_subclass_inline(
         // subclass body, so feeding an empty census avoids the full
         // DEX walk per inlined subclass without changing behaviour.
         let empty_census = r8_inversion::TrampolineCensus::default();
-        match decompile_method(dex, data, em, sub_cd, &mut imports, false, trace, &empty_census) {
+        match decompile_method(
+            dex,
+            data,
+            em,
+            sub_cd,
+            &mut imports,
+            false,
+            trace,
+            &empty_census,
+            false,
+        ) {
             Ok(source) => method_bodies.push(source),
             Err(_) => {
                 return bail("subclass method decompile error");

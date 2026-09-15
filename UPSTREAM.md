@@ -62,6 +62,18 @@ way):
 Accepting `header_size == 0x78` (and documenting which `file_size` semantics the
 parser expects for such input) would remove our workaround.
 
+## 4. Enum rendering when `$values()` is inlined
+
+The enum path suppresses `$VALUES` / `values()` / `valueOf(String)` / the synthetic
+constructor parameters when it can render the constants inline, and that recogniser
+requires the `$values()` static call in `<clinit>`. R8 sometimes builds the `$VALUES`
+array inline instead, and the suppression then fires without the inline render, leaving
+a constructor with no parameters and a `static {}` block that calls it with two
+(`Lcom/mobsandgeeks/saripaar/annotation/CreditCard$Type;` on `com.xiaomi.router` is the
+one-line reproducer). Gating the suppression on the inline render succeeding is a small
+change to `classes.rs` (`EnumCtx::applies`), and it also covers the `super(name,
+ordinal)` strip in `maybe_strip_enum_super_call`.
+
 ## What we do meanwhile
 
 `vendor/droidsaw-dex` carries both changes as a patch (`PATCHES.md` documents each

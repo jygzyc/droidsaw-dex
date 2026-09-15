@@ -177,6 +177,44 @@ representation with three new decoder cases: a seven-register `/range` call, an
 `arg_count == 0` list whose `CCCC` field must round-trip, and `RegList`'s plain/range
 byte-identity (`emit_dex`).
 
+## 6. Enums whose constants carry no user arguments
+
+`classes.rs` renders a javac-shaped enum as source-level declarations (`AMEX, VISA(...)`
+at the top of the body) and, when it does, elides the members javac synthesises:
+`$VALUES`, `$values()`, `values()`, `valueOf(String)`, the `(String name, int ordinal)`
+pair on the constructor, the implicit `super(name, ordinal)` call, and the `<clinit>`
+that populates the constants. The recogniser that decides whether that inline render is
+safe requires the `$values()` static call in `<clinit>`.
+
+R8 does not always emit it: `Lcom/mobsandgeeks/saripaar/annotation/CreditCard$Type;`
+builds its `$VALUES` array inline, so the recogniser bailed — and because the
+suppression rows were gated on the *structural* test (`ACC_ENUM` + superclass
+`Ljava/lang/Enum;`) instead of on the inline render succeeding, the fall-through render
+came out self-contradictory:
+
+```java
+private CreditCard$Type() { }                     // parameters and super() gone
+static { ... new CreditCard$Type("AMEX", 0); }    // called with two arguments
+```
+
+with `values()` / `valueOf(String)` / `$VALUES` suppressed although the declarations that
+stand in for them were never emitted. The fix (`enum_ctx.applies = false` when
+`enum_constant_emitted` is empty, plus the matching gate on the constructor parameter
+stripping in `decompile_method`) leaves the fall-through path rendering what the class
+really contains:
+
+```java
+private CreditCard$Type(String v1, int v2) { super(v1, v2); }
+public static CreditCard$Type valueOf(String v1) { ... }
+public static CreditCard$Type[] values() { ... }
+```
+
+Measured effect: `cargo test` (955 tests) still passes; on the device corpus (1,080
+classes across five archives) `bench/quality_vs_reference.py` drops from 157 to 146
+flagged classes (method-set 129 -> 117) with no class regressing. Before this goes
+upstream the shape wants a byte-for-byte fixture in `tests/` so the branch that R8
+triggers here is pinned.
+
 ## Safety
 
 `rasc` never re-emits DEX bytes, so none of the skipped structures are observable
