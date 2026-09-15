@@ -115,7 +115,8 @@ is small and cosmetic: mostly an inverted `if (cond) { } else { body }` where th
 reference writes `if (!cond) { body }`, plus guard chains whose shared target is a
 switch-case arm.
 
-Safety: `cargo test` (940 tests, including the structurer's tree-shape tests) passes;
+Safety: `cargo test` (954 tests — 940 unit + 14 integration/doc — including the
+structurer's tree-shape tests) passes;
 the two corpus sweeps above decompile every class of both archives without an error;
 `bench/quality_vs_reference.py` in ASC — which compares `rasc getclass` against the
 reference decompiler per class — reports, on the same fixture sample, flagged classes
