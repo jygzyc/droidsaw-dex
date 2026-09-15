@@ -890,7 +890,7 @@ impl<'dex> EmulatorCore<'dex> {
                     // For invoke-virtual / invoke-direct: src[0] is `this`,
                     // src[1..] are the typed arguments.
                     // For invoke-static: src[0..] are all arguments.
-                    let arg_regs = insn.src.as_slice();
+                    let arg_regs: Vec<u16> = insn.src.registers().collect();
                     let (this_val, typed_args) = if is_static {
                         let args: Vec<Value> = arg_regs
                             .iter()

@@ -427,7 +427,7 @@ fn token_for(
     if let Some(d) = insn.dst {
         regs.push(d);
     }
-    regs.extend_from_slice(insn.src.as_slice());
+    regs.extend(insn.src.registers());
     let lit = if format_has_immediate(insn_format(insn.op)) {
         Some(insn.literal)
     } else {

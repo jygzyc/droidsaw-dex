@@ -187,7 +187,9 @@ fn classify_reg_use(insn: &Instruction) -> RegUse {
         | FilledNewArray
         | FilledNewArrayRange => RegUse {
             def: None,
-            reads: src.to_vec(),
+            // `/range` invokes name up to 255 contiguous registers; `as_slice`
+            // stops at the five the inline array holds, so walk the whole list.
+            reads: insn.src.registers().collect(),
             def_wide: false,
         },
 

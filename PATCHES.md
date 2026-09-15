@@ -2,22 +2,25 @@
 
 This branch is [`droidsaw/droidsaw-dex`](https://github.com/droidsaw/droidsaw-dex) at the
 `2.0.0` release commit (`7ab14972`, 2026-06-11) plus the changes the native Rust CLI
-`rasc` (the `rust` branch of the ASC repository) needs. The ASC repository consumes it as a
-git submodule at `vendor/droidsaw-dex` and patches `droidsaw-dex` to that path in its
-`Cargo.toml`.
+`rasc` (the `rust` branch of the ASC repository) needs. The ASC repository vendors it at
+`vendor/droidsaw-dex` (a plain directory, not a submodule) and patches `droidsaw-dex` to
+that path in its `Cargo.toml`.
 
 Updating to a new upstream release: on this branch, `git fetch upstream`, `git rebase
-<new tag>`, push, then bump the submodule pointer in ASC. The commits are ordered so that
-the rebase is a plain replay — the manifest commit first (it is the one upstream will
-conflict with, on a version bump), then the two parser patches.
+<new tag>`, push, then copy the tree over ASC's `vendor/droidsaw-dex` and rebuild. The
+commits are ordered so that the rebase is a plain replay — the manifest commit first (it is
+the one upstream will conflict with, on a version bump), then the parser patches.
 
-Everything outside `Cargo.toml` and `src/parser/mod.rs` is upstream's tree, untouched:
-`src/` apart from those files is byte-identical to the published crate, and `LICENSE`
-(BSD-3-Clause) is kept as shipped. The patched lines are marked `PATCHED (rasc)`.
+Everything outside `Cargo.toml`, `src/parser/mod.rs`, `src/structure.rs` and the register
+list in `src/decode.rs` is upstream's tree, untouched: the rest of `src/` is byte-identical
+to the published crate, and `LICENSE` (BSD-3-Clause) is kept as shipped. The patched lines
+are marked `PATCHED (rasc)`.
 
-The one behavioural patch outside the parser is [4] below: a structurer fix for `||`
-guard chains that silently dropped a branch body. It is the only change that alters
-decompiled output, and it is the reason the branch carries `src/structure.rs` at all.
+Two patches change decompiled output, and they are the reason this branch carries
+`src/structure.rs` and touches the decoder at all: [4] keeps a shared `||` guard-chain body
+on every path (including paths that share a body inside a loop), and [5] represents
+`/range` register lists longer than five registers, which the SSA pass and the emitter need
+in order to render every argument of a call.
 
 ## 0. Self-contained manifest (fork-only, not an upstream request)
 
@@ -88,8 +91,11 @@ Two changes in `src/structure.rs`:
   (`shared_regions`, capped at 64 regions per method). A later guard on the same
   target emits an identical copy of the remembered region instead of an empty body,
   so each path keeps the body and the region is still emitted once at its original
-  position. Targets that are loop headers/bodies are never reused — those keep the
-  previous shape rather than risk an unsound copy.
+  position. Targets that are loop *headers* are never reused — that target is a
+  `continue` shape, not a region — but a target inside a loop body is a normal shared
+  body and is copied: `if (cond1 || cond2) { body }` inside a loop (the
+  `getA11yFeatureToTileMapInternal` shape in `services.jar`) lost its body on the
+  second guard without this.
 - A post-pass rewrites `if (c) { } else { body }` to `if (!c) { body }`. That empty
 then-body is exactly what a guard chain produced; the negated form says the same
 thing the source-level condition said, and matches the reference implementation's
@@ -100,16 +106,62 @@ empty control-flow body):
 
 | corpus | classes | before | after |
 | --- | ---: | ---: | ---: |
-| fixture APK | 6,220 | 458 | 153 |
-| `services.jar` | 18,692 | 1,206 | 539 |
+| fixture APK | 6,220 | 458 | 80 |
+| `services.jar` | 18,692 | 1,206 | 232 |
 
-Safety: `cargo test` (936 tests, including the structurer's tree-shape tests) passes;
+`unsupported` (the raw-smali fallback) is unchanged at 260 classes on `services.jar`:
+this patch removes the *silent* loss, not the classes the emitter declines. What is left
+is small and cosmetic: mostly an inverted `if (cond) { } else { body }` where the
+reference writes `if (!cond) { body }`, plus guard chains whose shared target is a
+switch-case arm.
+
+Safety: `cargo test` (940 tests, including the structurer's tree-shape tests) passes;
 the two corpus sweeps above decompile every class of both archives without an error;
 `bench/quality_vs_reference.py` in ASC — which compares `rasc getclass` against the
-reference decompiler per class — reports empty-control-flow classes dropping 7 -> 2 on
-its fixture sample. The shapes this does *not* cover (a guard whose target is inside a
-loop, switch-case arms sharing a body) keep the historical output and are the subject
-of the remaining empty-body classes in the sweeps.
+reference decompiler per class — reports, on the same fixture sample, flagged classes
+dropping 16 -> 7, empty control-flow bodies 7 -> 0 and lost string literals 9 -> 1, with
+no class losing a method or literal on `services.jar`'s
+`AccessibilityManagerService` (the largest class in the corpus, 5,523 statements
+rendered).
+
+## 5. `/range` register lists longer than five registers
+
+`invoke-*/range`, `filled-new-array/range` and `invoke-polymorphic/range` carry an 8-bit
+`arg_count`, so a range list can name up to 255 registers. `RegList` stores five
+registers inline (`regs: [u16; 5]`) and the decoder capped the list at five:
+
+```rust
+let count = arg_count.min(5) as u8;   // registers past the fifth never existed
+insn.src = RegList::from_slice(registers[..count]);
+```
+
+The SSA builder, the emulator and the smali printer all read `insn.src.as_slice()`, so
+every call with more than five argument registers lost its tail: `rasc getclass` printed
+a call with fewer arguments than the callee's descriptor. `AccessibilityManagerService`
+illustrates it — the reference and the upstream (dexdec-based) `rasc` both print five
+arguments, this build printed four:
+
+```java
+// reference: five arguments, the last one the empty string
+persistColonDelimitedSetToSettingLocked(v5, userId, v7, v8, "");
+```
+
+Fix: `RegList` gains a `range_len: u8`. When it is non-zero the list is a `/range` list
+and `regs[0]` is the base; `register(index)` derives `base + index` (checked in `u32`),
+`registers()` yields the whole list, and `len()` reports the wire `arg_count`, so
+`as_slice()` keeps returning the inline prefix the existing callers expect. `regs[0]`
+holds the base even at `arg_count == 0`, where the spec calls the field irrelevant but
+the DEX encoder needs the original byte for byte-identity. `from_slice` takes the range
+form for contiguous lists longer than five registers, and the decoder validates
+`start_reg + arg_count` before building the list — which is what makes the compact
+representation sound.
+
+Measured effect: `services.jar`'s `AccessibilityManagerService` keeps all five arguments
+and no longer differs from the reference on a single string literal;
+`bench/quality_vs_reference.py` shows no other class regressing. `cargo test` covers the
+representation with three new decoder cases: a seven-register `/range` call, an
+`arg_count == 0` list whose `CCCC` field must round-trip, and `RegList`'s plain/range
+byte-identity (`emit_dex`).
 
 ## Safety
 
@@ -131,7 +183,9 @@ in its output. Three layers guard the claim:
 3. `bench/contracts.sh` decompiles the same packaged class through its dotted and
    slashed spellings and requires identical sources.
 
-`UPSTREAM.md` in this branch is the ready-to-file request for all three changes
-(measurements included). Once upstream grows a public parse scope — or accepts the
-0x78-byte DEX 041 header discussed there — this branch should be dropped in favour of a
-submodule pointer to the release itself.
+## Dropping this branch
+
+`UPSTREAM.md` in this branch is the ready-to-file summary of these changes
+(measurements included). Once upstream grows a public parse scope, or accepts the
+0x78-byte DEX 041 header discussed there, this branch can go back to a pointer at the
+published release.

@@ -206,11 +206,17 @@ pub(crate) fn format_size(fmt: InsnFormat) -> u8 {
 
 // ── Instruction types ───────────────────────────────────────────────
 
-/// Up to 5 source registers, stored inline.
+/// Up to 5 source registers, stored inline; `/range` formats may name more (see
+/// [`RegList::range`]), in which case the registers past the fifth are derived
+/// from the base on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct RegList {
     regs: [u16; 5],
     len: u8,
+    /// A `/range` list of more than five registers: `regs[0]` is the base and this
+    /// is the full count (the wire format's `arg_count` is 8 bits). `0` means the
+    /// list is a plain inline list of `len` registers.
+    range_len: u8,
 }
 
 impl RegList {
@@ -218,6 +224,7 @@ impl RegList {
         Self {
             regs: [0; 5],
             len: 0,
+            range_len: 0,
         }
     }
 
@@ -225,6 +232,7 @@ impl RegList {
         Self {
             regs: [r, 0, 0, 0, 0],
             len: 1,
+            range_len: 0,
         }
     }
 
@@ -232,10 +240,55 @@ impl RegList {
         Self {
             regs: [a, b, 0, 0, 0],
             len: 2,
+            range_len: 0,
+        }
+    }
+
+    /// A `/range` register list: `count` contiguous registers starting at `base`.
+    ///
+    /// `/range` formats carry an 8-bit `arg_count`, so a list can name up to 255
+    /// registers and does not fit the inline array. `regs[0]` always holds `base`
+    /// (the encoder reads it back with [`RegList::raw_at`], even at `count == 0`,
+    /// where the wire field is spec-irrelevant but byte-identity load-bearing);
+    /// [`RegList::register`] derives the registers past the fifth on demand.
+    pub fn range(base: u16, count: usize) -> Self {
+        let inline = count.min(5);
+        let mut regs = [0u16; 5];
+        // `regs[0]` holds the base even at `count == 0`: the encoder reads it back
+        // through `raw_at(0)` to preserve an on-disk `CCCC` field that the spec
+        // marks irrelevant but that byte-identity checks compare.
+        let filled = inline.max(1);
+        for (index, slot) in regs.iter_mut().enumerate().take(filled) {
+            let offset = u16::try_from(index).unwrap_or(u16::MAX);
+            *slot = base.saturating_add(offset);
+        }
+        Self {
+            regs,
+            #[allow(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "PROOF: inline = count.min(5) ≤ 5 (usize, masked by .min(5)); fits u8 on all platforms."
+            )]
+            len: inline as u8,
+            #[allow(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "PROOF: the wire format's arg_count is a byte, so count ≤ 255; `count.min(255)` is therefore exact and fits u8."
+            )]
+            range_len: if count > 5 { count.min(255) as u8 } else { 0 },
         }
     }
 
     pub fn from_slice(s: &[u16]) -> Self {
+        // A `/range` list longer than the inline array is representable whenever
+        // the registers are contiguous — which is exactly what `/range` means;
+        // anything else keeps the historical truncation.
+        let contiguous = s.windows(2).all(|pair| {
+            pair.first().and_then(|first| first.checked_add(1)) == pair.get(1).copied()
+        });
+        if s.len() > 5 && contiguous {
+            return Self::range(s.first().copied().unwrap_or(0), s.len());
+        }
         let mut regs = [0u16; 5];
         let count = s.len().min(5);
         // PROOF: `count = s.len().min(5) ≤ 5`; `regs: [u16; 5]` so `regs.get_mut(..count)` and `s.get(..count)` are both `Some`. `unwrap_or` defense-in-depth fires on no path.
@@ -250,20 +303,50 @@ impl RegList {
                 reason = "PROOF: count = s.len().min(5) ≤ 5 (usize, masked by .min(5)); fits u8 on all platforms."
             )]
             len: count as u8,
+            range_len: 0,
         }
     }
 
+    /// The inline registers (`min(len(), 5)` entries). A `/range` list longer
+    /// than five registers exposes only its first five here; use
+    /// [`RegList::registers`] to walk the whole list.
     pub fn as_slice(&self) -> &[u16] {
         // PROOF: `self.len ≤ 5` is enforced at every constructor (`empty/one/two/from_slice/...`). `regs: [u16; 5]` so `.get(..usize::from(self.len))` is `Some` on every well-constructed RegList. `unwrap_or(&[])` is dead defense-in-depth.
         self.regs.get(..usize::from(self.len)).unwrap_or(&[])
     }
 
     pub fn len(&self) -> usize {
-        usize::from(self.len)
+        if self.range_len == 0 {
+            usize::from(self.len)
+        } else {
+            usize::from(self.range_len)
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
+    }
+
+    /// The register at `index`, or `None` when the list names fewer registers.
+    ///
+    /// `/range` lists are contiguous, so registers past the fifth are the base
+    /// plus the index. `u16` arithmetic is widened to `u32` and checked, which
+    /// cannot fail for a list the decoder validated (`base + count ≤ 0x1_0000`).
+    pub fn register(&self, index: usize) -> Option<u16> {
+        if index >= self.len() {
+            return None;
+        }
+        if self.range_len != 0 {
+            let base = u32::from(self.regs.first().copied().unwrap_or(0));
+            let offset = u32::try_from(index).ok()?;
+            return u16::try_from(base.checked_add(offset)?).ok();
+        }
+        self.regs.get(index).copied()
+    }
+
+    /// Every register the list names, in order.
+    pub fn registers(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..self.len()).filter_map(|index| self.register(index))
     }
 
     /// Return `regs[idx]` regardless of `len`. Used by F3rc/F4rcc emit
@@ -886,27 +969,29 @@ fn decode_single(
             let u2 = read_unit(data, insns_off, pc, 2)?;
 
             let start_reg = u2;
-            let mut regs = RegList::empty();
+            // `aa` is 8 bits wide, so a range list can name up to 255 registers —
+            // more than the inline array holds. Validate every register the
+            // instruction names first: that check is what makes the compact
+            // base + count representation sound.
+            let count = usize::from(arg_count);
+            for index in 0..count {
+                let offset = u16::try_from(index).unwrap_or(u16::MAX);
+                start_reg.checked_add(offset).ok_or_else(|| {
+                    DexError::InvalidInstruction {
+                        offset: pc,
+                        detail: format!(
+                            "start_reg overflow in F3rc: {start_reg} + {offset} exceeds u16"
+                        ),
+                    }
+                })?;
+            }
             // Always preserve start_reg in regs.regs[0], even when
             // arg_count == 0 (where the spec marks the CCCC field as
             // irrelevant). The bytes are still on disk and load-bearing
             // for byte-identity preservation. Real-world files sometimes
             // have non-zero CCCC under AA=0 invokes that canonical emit
             // would silently re-zero.
-            regs.regs[0] = start_reg;
-            let count = arg_count.min(5) as u8;
-            for i in 0..u16::from(count) {
-                regs.regs[i as usize] = start_reg.checked_add(i).ok_or_else(|| {
-                    DexError::InvalidInstruction {
-                        offset: pc,
-                        detail: format!(
-                            "start_reg overflow in F3rc: {start_reg} + {i} exceeds u16"
-                        ),
-                    }
-                })?;
-            }
-            regs.len = count;
-            insn.src = regs;
+            insn.src = RegList::range(start_reg, count);
             insn.literal = i64::from(arg_count); // store full count for range
             insn.pool_idx = Some(classify_pool_3rc(op, u32::from(u1)));
         }
@@ -2080,6 +2165,69 @@ mod tests {
             data.extend_from_slice(&u.to_le_bytes());
         }
         data
+    }
+
+    // A `/range` list can name up to 255 registers (the wire format's arg_count is
+    // a byte); only the first five fit the inline array, the rest are derived from
+    // the base. Regression: they used to be dropped at decode time, so every caller
+    // (SSA, emulator) saw a truncated argument list.
+    #[test]
+    fn decode_invoke_range_keeps_registers_past_the_inline_five() {
+        // invoke-virtual/range {v100 .. v106}, method@0x0002 — AA = 7
+        let data = make_insns(&[(7 << 8) | 0x74, 0x0002, 0x0064]);
+        let (insns, _, _) = decode_insns(&data, 0, 3).unwrap();
+        assert_eq!(insns[0].op, Opcode::InvokeVirtualRange);
+        assert_eq!(insns[0].literal, 7, "full arg_count is kept in literal");
+        assert_eq!(insns[0].src.len(), 7);
+        assert_eq!(
+            insns[0].src.registers().collect::<Vec<_>>(),
+            vec![100, 101, 102, 103, 104, 105, 106]
+        );
+        assert_eq!(insns[0].src.as_slice(), &[100, 101, 102, 103, 104]);
+        assert_eq!(insns[0].src.raw_at(0), 100, "start_reg stays in slot 0");
+        assert_eq!(insns[0].src.register(4), Some(104));
+        assert_eq!(insns[0].src.register(5), Some(105));
+        assert_eq!(insns[0].src.register(6), Some(106));
+        assert_eq!(insns[0].src.register(7), None);
+    }
+
+    #[test]
+    fn decode_invoke_range_zero_args_keeps_start_reg() {
+        // AA = 0 with a non-zero CCCC: spec-irrelevant but byte-identity bearing.
+        let data = make_insns(&[0x0074, 0x0002, 0x0099]);
+        let (insns, _, _) = decode_insns(&data, 0, 3).unwrap();
+        assert_eq!(insns[0].src.len(), 0);
+        assert!(insns[0].src.is_empty());
+        assert_eq!(insns[0].src.raw_at(0), 0x99);
+    }
+
+    #[test]
+    fn reg_list_range_form() {
+        let list = RegList::range(10, 7);
+        assert_eq!(list.len(), 7);
+        assert!(!list.is_empty());
+        assert_eq!(list.as_slice(), &[10, 11, 12, 13, 14]);
+        assert_eq!(
+            list.registers().collect::<Vec<_>>(),
+            vec![10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(list.register(6), Some(16));
+        assert_eq!(list.register(7), None);
+
+        // A contiguous slice longer than the inline array takes the range form...
+        let list = RegList::from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(list.len(), 7);
+        assert_eq!(list.register(6), Some(7));
+
+        // ...and a non-contiguous one keeps the historical truncation.
+        let list = RegList::from_slice(&[1, 3, 5, 7, 9, 11]);
+        assert_eq!(list.len(), 5);
+        assert_eq!(list.as_slice(), &[1, 3, 5, 7, 9]);
+
+        // `range(base, 0)` still carries the base for the encoder.
+        let list = RegList::range(0x1234, 0);
+        assert_eq!(list.len(), 0);
+        assert_eq!(list.raw_at(0), 0x1234);
     }
 
     #[test]

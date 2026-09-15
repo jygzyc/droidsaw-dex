@@ -8060,11 +8060,30 @@ mod tests {
         // range form: literal = arg_count, src[0] = start_reg.
         // Decoder populates src with first min(count, 5) regs starting from start_reg.
         i.literal = 7; // 7-argument range call
-        i.src = RegList::from_slice(&[100, 101, 102, 103, 104]); // decoder caps at 5
+        i.src = RegList::from_slice(&[100, 101, 102, 103, 104]); // inline prefix
         i.pool_idx = Some(PoolIndex::Method(Method(0x20)));
         let out = roundtrip_insn(i);
         assert_eq!(out.literal, 7);
         assert_eq!(out.src.as_slice()[0], 100, "start_reg roundtrip");
+    }
+
+    // F3rc with more registers than the inline array holds: the decoder used to
+    // cap the register list at five, so the SSA pass and the emulator never saw
+    // the last arguments (a 5-argument call rendered as 4 arguments).
+    #[test]
+    fn insn_f3rc_invoke_virtual_range_beyond_inline() {
+        let mut i = insn(Opcode::InvokeVirtualRange);
+        i.literal = 7;
+        i.src = RegList::from_slice(&[100, 101, 102, 103, 104, 105, 106]);
+        i.pool_idx = Some(PoolIndex::Method(Method(0x20)));
+        let out = roundtrip_insn(i);
+        assert_eq!(out.literal, 7);
+        assert_eq!(out.src.len(), 7);
+        assert_eq!(
+            out.src.registers().collect::<Vec<_>>(),
+            vec![100, 101, 102, 103, 104, 105, 106]
+        );
+        assert_eq!(out.src.as_slice(), &[100, 101, 102, 103, 104]);
     }
 
     // F51l — const-wide vAA, #+BBBBBBBBBBBBBBBB (64-bit literal).
