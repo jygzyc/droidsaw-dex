@@ -1267,14 +1267,45 @@ impl DexFile {
         data.hash(&mut h);
         let hash = format!("{:016x}", h.finish());
         droidsaw_common::diag::with_input_hash(&hash, || {
-            let parsed = Self::parse_inner(data)?;
+            let parsed = Self::parse_inner(data, true, None)?;
             droidsaw_common::diag::stage_dump("parser", &ParserSnapshot::from(&parsed));
             Ok(parsed)
         })
     }
 
 
-    fn parse_inner(data: &[u8]) -> Result<Self> {
+    /// PATCHED (rasc): parse for decompilation only.
+    ///
+    /// Skips the work whose only consumers are the emit path:
+    /// the whole-input SHA-1 (`input_checksums_canonical`) and
+    /// `parse_map_driven_sections` (method handles, call-site ids and their
+    /// encoded arrays, plus the section-walk parse-error side-channel).
+    /// Decompilation reads none of them; rasc verifies that on every corpus
+    /// APK by diffing `decompile_class` output against the full parse.
+    pub fn parse_for_decompilation(data: &[u8]) -> Result<Self> {
+        Self::parse_inner(data, false, None)
+    }
+
+    /// PATCHED (rasc): parse only what is needed to decompile `descriptor`.
+    /// Others' class_data / code_item / static-value tables are left empty;
+    /// rasc verifies the decompiled output is byte-identical to the full parse
+    /// for every class it asks for (see the equivalence sweep in the harness).
+    pub fn parse_for_class(data: &[u8], descriptor: &str) -> Result<Self> {
+        let scoped = Self::parse_inner(data, false, Some(descriptor))?;
+        // Safety net: a descriptor that matches no class would leave every
+        // class body unparsed. Fall back to the full parse instead of handing
+        // back a DEX whose classes have no code.
+        let matched = scoped.class_defs.iter().any(|cd| {
+            scoped
+                .type_descriptors
+                .get(cd.class_idx.0 as usize)
+                .map(String::as_str)
+                == Some(descriptor)
+        });
+        if matched { Ok(scoped) } else { Self::parse_inner(data, false, None) }
+    }
+
+    fn parse_inner(data: &[u8], emit_support: bool, target: Option<&str>) -> Result<Self> {
         let header = DexHeader::parse(data)?;
         header.verify_checksum(data)?;
         // Structural pre-condition: the six id-sections must not alias each
@@ -1286,7 +1317,7 @@ impl DexFile {
         // canonical-input-SHA files via CanonicalTransform::InputChecksumNormalized
         // on the emit side. Real-world DEX files sometimes ship with
         // stored-SHA ≠ SHA-1(input[32..]).
-        let input_checksums_canonical = {
+        let input_checksums_canonical = if emit_support {
             use sha1::{Digest, Sha1};
             let file_size = header.file_size as usize;
             data.get(32..file_size).is_some_and(|slice| {
@@ -1295,7 +1326,7 @@ impl DexFile {
                 let computed: [u8; 20] = sha.finalize().into();
                 computed == header.signature
             })
-        };
+        } else { false };
 
         let (strings, string_data_offs) = Self::parse_string_pool(data, &header)?;
         let (type_descriptors, type_descriptor_idxs) = Self::parse_types(data, &header, &strings)?;
@@ -1472,6 +1503,11 @@ impl DexFile {
         let mut encoded_arrays = BTreeMap::new();
         let mut encoded_array_widths: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         for cd in &class_defs {
+            if let Some(t) = target {
+                if type_descriptors.get(cd.class_idx.0 as usize).map(String::as_str) != Some(t) {
+                    continue;
+                }
+            }
             if cd.static_values_off == 0 || encoded_arrays.contains_key(&cd.static_values_off) {
                 continue;
             }
@@ -1516,6 +1552,11 @@ impl DexFile {
         let mut raw_class_data_bytes: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         let mut code_items = BTreeMap::new();
         for cd in &class_defs {
+            if let Some(t) = target {
+                if type_descriptors.get(cd.class_idx.0 as usize).map(String::as_str) != Some(t) {
+                    continue;
+                }
+            }
             if cd.class_data_off == 0 {
                 continue;
             }
@@ -1567,7 +1608,11 @@ impl DexFile {
         // DEXes simply lack these sections so the vectors stay empty.
         // Malformed entries are silently skipped so a corrupt bootstrap
         // encoded_array doesn't abort the whole parse.
-        let (method_handles, call_site_ids) = Self::parse_map_driven_sections(data, &header);
+        let (method_handles, call_site_ids) = if emit_support {
+            Self::parse_map_driven_sections(data, &header)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Populate dex.encoded_arrays with each call_site's referenced
         // encoded_array content. Keying by offset means sharing across
