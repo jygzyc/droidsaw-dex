@@ -12,8 +12,12 @@ the rebase is a plain replay — the manifest commit first (it is the one upstre
 conflict with, on a version bump), then the two parser patches.
 
 Everything outside `Cargo.toml` and `src/parser/mod.rs` is upstream's tree, untouched:
-`src/` apart from that one file is byte-identical to the published crate, and `LICENSE`
+`src/` apart from those files is byte-identical to the published crate, and `LICENSE`
 (BSD-3-Clause) is kept as shipped. The patched lines are marked `PATCHED (rasc)`.
+
+The one behavioural patch outside the parser is [4] below: a structurer fix for `||`
+guard chains that silently dropped a branch body. It is the only change that alters
+decompiled output, and it is the reason the branch carries `src/structure.rs` at all.
 
 ## 0. Self-contained manifest (fork-only, not an upstream request)
 
@@ -64,6 +68,48 @@ The entries are independent, and rayon's ordered collect keeps the first error
 (lowest index) winning, so behaviour is unchanged while the pool decodes on every
 core. Measured on the same 9.8 MiB DEX: 9.4 ms -> sub-millisecond for a class-scoped
 parse, which is most of what a `getclass` scoped parse still spent.
+
+## 4. `||` guard chains keep their body on every path
+
+Dalvik lowers `a || b || c` in a condition to a *guard chain*: each test branches to
+one shared body block placed after the chain, otherwise it falls through to the next
+test. The structurer's block walk (`drive_processing` in `src/structure.rs`) marks a
+block as visited when it first structures it and skips it on every later visit, so
+the walk structured the body at the first guard and the two later guards then saw an
+already-visited target. The if/else frames render an already-visited target as no
+body at all, so the body silently disappeared from those paths — for
+`androidx.core.content.IntentSanitizer$Api31Impl.checkOtherMembers` the
+`Consumer.accept(...)` call survived only in the first of the three `||` arms.
+
+Two changes in `src/structure.rs`:
+
+- The guard frames now carry their branch target and merge block, and the walk
+  remembers the statement tree it emitted for a `(target, merge)` region
+  (`shared_regions`, capped at 64 regions per method). A later guard on the same
+  target emits an identical copy of the remembered region instead of an empty body,
+  so each path keeps the body and the region is still emitted once at its original
+  position. Targets that are loop headers/bodies are never reused — those keep the
+  previous shape rather than risk an unsound copy.
+- A post-pass rewrites `if (c) { } else { body }` to `if (!c) { body }`. That empty
+then-body is exactly what a guard chain produced; the negated form says the same
+thing the source-level condition said, and matches the reference implementation's
+output for these methods.
+
+Measured effect (whole-corpus `getclass` sweep, classes whose output contained an
+empty control-flow body):
+
+| corpus | classes | before | after |
+| --- | ---: | ---: | ---: |
+| fixture APK | 6,220 | 458 | 153 |
+| `services.jar` | 18,692 | 1,206 | 539 |
+
+Safety: `cargo test` (936 tests, including the structurer's tree-shape tests) passes;
+the two corpus sweeps above decompile every class of both archives without an error;
+`bench/quality_vs_reference.py` in ASC — which compares `rasc getclass` against the
+reference decompiler per class — reports empty-control-flow classes dropping 7 -> 2 on
+its fixture sample. The shapes this does *not* cover (a guard whose target is inside a
+loop, switch-case arms sharing a body) keep the historical output and are the subject
+of the remaining empty-body classes in the sweeps.
 
 ## Safety
 

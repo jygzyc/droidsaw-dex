@@ -831,6 +831,12 @@ struct StructureCtx<'a> {
     ipdom: BTreeMap<BlockIdx, droidsaw_common::PostDom<BlockIdx>>,
     loops: Vec<NaturalLoop>,
     visited: BTreeSet<BlockIdx>,
+    /// Stmt tree emitted for a `(entry block, end block)` region. Dalvik lowers
+    /// `if (a || b) { body }` to a chain of guards sharing one body block; the
+    /// walk structures that body once (at the first guard) and later guards see
+    /// the block as already `visited`. This table lets those later guards emit
+    /// a copy of the same region instead of an empty body.
+    shared_regions: BTreeMap<(BlockIdx, Option<BlockIdx>), Stmt>,
 }
 
 /// Structure the SSA body and CFG into a Stmt tree.
@@ -852,12 +858,48 @@ pub fn structure(ssa: &SsaBody, cfg: &Cfg) -> Stmt {
         ipdom,
         loops,
         visited: BTreeSet::new(),
+        shared_regions: BTreeMap::new(),
     };
 
     let out = structure_region(&mut ctx, cfg.entry, None);
     let out = reconstruct_short_circuit_guards(out);
     droidsaw_common::diag::stage_dump("structure", &out);
     out
+}
+
+/// `if (cond) { } else { body }` says the same thing as `if (!cond) { body }`.
+///
+/// The structurer emits the empty-then form whenever a guard's branch target is
+/// the merge point and the fall-through carries the body (the `||`/`&&` guard
+/// chain shape, and `if (a) goto done;`-style early exits). An empty statement
+/// block is legal but reads as if the body ran on the inverted condition; the
+/// negated form says the same thing the way the source would.
+fn normalize_empty_then(
+    cond: Condition,
+    then_body: Box<Stmt>,
+    else_body: Option<Box<Stmt>>,
+) -> Stmt {
+    if then_body.is_empty_seq() {
+        if let Some(else_body) = else_body {
+            if !else_body.is_empty_seq() {
+                return Stmt::If {
+                    cond: negate_condition(cond),
+                    then_body: else_body,
+                    else_body: None,
+                };
+            }
+            return Stmt::If {
+                cond,
+                then_body,
+                else_body: Some(else_body),
+            };
+        }
+    }
+    Stmt::If {
+        cond,
+        then_body,
+        else_body,
+    }
 }
 
 /// Post-structuring rewrite pass for short-circuit `||` reconstruction.
@@ -1039,11 +1081,7 @@ fn reconstruct_short_circuit_guards(stmt: Stmt) -> Stmt {
             let else_body = else_body
                 .as_ref()
                 .map(|e| Box::new(reconstruct_short_circuit_guards((**e).clone())));
-            Stmt::If {
-                cond: cond.clone(),
-                then_body,
-                else_body,
-            }
+            normalize_empty_then(cond.clone(), then_body, else_body)
         }
         Stmt::If {
             cond,
@@ -1159,19 +1197,39 @@ fn structure_region(ctx: &mut StructureCtx, start: BlockIdx, end: Option<BlockId
                 end,
                 stmts,
                 cond,
+                then_target,
                 else_target,
                 merge,
                 continuation,
             } => {
                 let then_body = result.take().unwrap_or_else(|| Stmt::Seq(vec![]));
+                remember_region(ctx, then_target, merge, &then_body);
                 // Spawn else body if it exists and isn't collapsed to merge
                 if let Some(et) = else_target {
                     if Some(et) != merge {
+                        // Shared guard target already structured by the walk:
+                        // emit a copy of that region instead of an empty else.
+                        if let Some(shared) = shared_region(ctx, else_target, merge) {
+                            let mut stmts = stmts;
+                            stmts.push(Stmt::If {
+                                cond,
+                                then_body: Box::new(then_body),
+                                else_body: Some(Box::new(shared)),
+                            });
+                            stack.push(Frame::Processing {
+                                end,
+                                stmts,
+                                current: continuation,
+                            });
+                            continue;
+                        }
                         stack.push(Frame::AwaitingIfElse {
                             end,
                             stmts,
                             cond,
                             then_body,
+                            else_target,
+                            merge,
                             continuation,
                         });
                         stack.push(Frame::Processing {
@@ -1200,9 +1258,12 @@ fn structure_region(ctx: &mut StructureCtx, start: BlockIdx, end: Option<BlockId
                 stmts,
                 cond,
                 then_body,
+                else_target,
+                merge,
                 continuation,
             } => {
                 let else_body_raw = result.take().unwrap_or_else(|| Stmt::Seq(vec![]));
+                remember_region(ctx, else_target, merge, &else_body_raw);
                 let else_body = if else_body_raw.is_empty_seq() {
                     None
                 } else {
@@ -1425,6 +1486,69 @@ fn structure_region(ctx: &mut StructureCtx, start: BlockIdx, end: Option<BlockId
     clippy::cast_possible_truncation,
     reason = "PROOF: blocks.len() bounded by DEX code_item insns_size (u32 by spec)."
 )]
+/// Upper bound on remembered `(entry, end)` regions per method.
+///
+/// A guard chain shares one body across a handful of guards; the cap keeps a
+/// pathological method from growing the structure pass's memory without bound.
+/// Regions beyond the cap keep the historical (empty-body) behaviour — never
+/// worse than before.
+const MAX_SHARED_REGIONS: usize = 64;
+
+/// A copy of a region the block walk has already structured, for a guard target
+/// that is shared by several conditional branches.
+///
+/// Dalvik lowers `if (a || b || c) { body }` to a guard chain whose branch
+/// target is one shared body block. The walk structures that body at the first
+/// guard and every later guard then sees the target as already `visited` —
+/// which used to emit an empty `if`/`else` body and silently drop the body from
+/// that path (ASC regression: `Consumer.accept` disappeared from two of the
+/// three paths of `IntentSanitizer$Api31Impl.checkOtherMembers`). Emitting a
+/// copy per guard keeps each guard's own path intact while the shared region
+/// itself is still emitted once at its original position, so no single
+/// execution path runs the body twice.
+///
+/// Returns `None` for targets that were never structured as a bounded region
+/// (a linear walk, a loop body, a block reached from an unbounded region):
+/// those keep the previous behaviour rather than risk a bogus copy.
+fn shared_region(
+    ctx: &StructureCtx,
+    target: Option<BlockIdx>,
+    merge: Option<BlockIdx>,
+) -> Option<Stmt> {
+    let target = target?;
+    if !ctx.visited.contains(&target) {
+        return None;
+    }
+    if ctx
+        .loops
+        .iter()
+        .any(|l| l.header == target || l.body.contains(&target))
+    {
+        return None;
+    }
+    ctx.shared_regions.get(&(target, merge)).cloned()
+}
+
+/// Remember the Stmt tree the walk emitted for the `(target, merge)` region so
+/// a later guard on the same target can emit an identical copy.
+fn remember_region(
+    ctx: &mut StructureCtx,
+    target: Option<BlockIdx>,
+    merge: Option<BlockIdx>,
+    body: &Stmt,
+) {
+    let Some(target) = target else {
+        return;
+    };
+    if body.is_empty_seq() || ctx.shared_regions.len() >= MAX_SHARED_REGIONS {
+        return;
+    }
+    let _ = ctx
+        .shared_regions
+        .entry((target, merge))
+        .or_insert_with(|| body.clone());
+}
+
 fn drive_processing(
     ctx: &mut StructureCtx,
     end: Option<BlockIdx>,
@@ -1559,13 +1683,17 @@ fn drive_processing(
             let then_body = if Some(then_target) == merge {
                 Some(Stmt::Seq(vec![]))
             } else {
-                None
+                // A guard target the walk already structured (the `if (a || b)`
+                // guard chain): reuse the remembered region instead of
+                // dropping the body from this path.
+                shared_region(ctx, Some(then_target), merge)
             };
 
             stack.push(Frame::AwaitingIfThen {
                 end,
                 stmts,
                 cond,
+                then_target: Some(then_target),
                 else_target: Some(else_target),
                 merge,
                 continuation,
@@ -1930,6 +2058,7 @@ enum Frame {
         end: Option<BlockIdx>,
         stmts: Vec<Stmt>,
         cond: Condition,
+        then_target: Option<BlockIdx>,
         else_target: Option<BlockIdx>,
         merge: Option<BlockIdx>,
         continuation: Option<BlockIdx>,
@@ -1940,6 +2069,8 @@ enum Frame {
         stmts: Vec<Stmt>,
         cond: Condition,
         then_body: Stmt,
+        else_target: Option<BlockIdx>,
+        merge: Option<BlockIdx>,
         continuation: Option<BlockIdx>,
     },
     /// Just launched a switch case body. When it returns, splice it
