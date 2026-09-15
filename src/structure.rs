@@ -418,6 +418,58 @@ impl Stmt {
     pub fn is_empty_seq(&self) -> bool {
         matches!(self, Stmt::Seq(v) if v.is_empty())
     }
+
+    /// Number of statements in this tree: the node itself plus every nested
+    /// statement (`Unrecognized` counts its raw instructions).
+    ///
+    /// Region reuse uses it to bound what a copy costs: a remembered region can
+    /// itself contain a copy, so the size of a single reuse is not capped by
+    /// the region count alone.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        fn body_node_count(body: &Stmt) -> usize {
+            body.node_count()
+        }
+        match self {
+            Stmt::Seq(stmts) => 1 + stmts.iter().map(Stmt::node_count).sum::<usize>(),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => 1 + body_node_count(then_body) + else_body.as_deref().map_or(0, Stmt::node_count),
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::Synchronized { body, .. }
+            | Stmt::ForEach { body, .. } => 1 + body_node_count(body),
+            Stmt::For {
+                init, update, body, ..
+            } => 1 + body_node_count(init) + body_node_count(update) + body_node_count(body),
+            Stmt::Switch { cases, default, .. } => {
+                1 + cases
+                    .iter()
+                    .map(|(_, body)| body_node_count(body))
+                    .sum::<usize>()
+                    + default.as_deref().map_or(0, Stmt::node_count)
+            }
+            Stmt::StringSwitch { cases, default, .. } => {
+                1 + cases
+                    .iter()
+                    .map(|(_, body)| body_node_count(body))
+                    .sum::<usize>()
+                    + default.as_deref().map_or(0, Stmt::node_count)
+            }
+            Stmt::TryCatch { body, catches } => {
+                1 + body_node_count(body)
+                    + catches.iter().map(|clause| body_node_count(&clause.body)).sum::<usize>()
+            }
+            Stmt::MultiArm { arms, default, .. } => {
+                1 + arms.iter().map(|arm| body_node_count(&arm.body)).sum::<usize>()
+                    + default.as_deref().map_or(0, Stmt::node_count)
+            }
+            Stmt::Unrecognized { raw, .. } => 1 + raw.len(),
+            _ => 1,
+        }
+    }
 }
 
 /// Collapse a single-element statement vector into that statement; otherwise
@@ -837,6 +889,9 @@ struct StructureCtx<'a> {
     /// the block as already `visited`. This table lets those later guards emit
     /// a copy of the same region instead of an empty body.
     shared_regions: BTreeMap<(BlockIdx, Option<BlockIdx>), Stmt>,
+    /// Statements region reuse has copied into this method so far, charged when
+    /// a copy is emitted so `shared_region` can stop before the copies compound.
+    cloned_statements: usize,
 }
 
 /// Structure the SSA body and CFG into a Stmt tree.
@@ -859,6 +914,7 @@ pub fn structure(ssa: &SsaBody, cfg: &Cfg) -> Stmt {
         loops,
         visited: BTreeSet::new(),
         shared_regions: BTreeMap::new(),
+        cloned_statements: 0,
     };
 
     let out = structure_region(&mut ctx, cfg.entry, None);
@@ -1494,6 +1550,25 @@ fn structure_region(ctx: &mut StructureCtx, start: BlockIdx, end: Option<BlockId
 /// worse than before.
 const MAX_SHARED_REGIONS: usize = 64;
 
+/// A region is remembered only while one copy of it stays small enough that it
+/// cannot dominate a method's output.
+///
+/// The copy a reuse emits can itself contain a copy — a guard chain inside a
+/// loop reuses a region whose body was built from earlier copies — so bounding
+/// the number of remembered regions does not bound the size of one reuse.
+const MAX_SHARED_REGION_STATEMENTS: usize = 4_096;
+
+/// Hard ceiling on how many statements region reuse may copy into one method.
+///
+/// Without it the copies compound: `services.jar`'s
+/// `com.android.server.display.DisplayPowerState$PhotonicModulator` structured
+/// to 2.27 GB of Java (the walk kept copying a shared region that already
+/// contained copies of another one). Reaching the ceiling costs only the copies
+/// that would have followed — each path falls back to the historical
+/// empty-body shape — so a method can never come out worse than before, and the
+/// output stays proportional to the input.
+const MAX_CLONED_STATEMENTS: usize = 65_536;
+
 /// A copy of a region the block walk has already structured, for a guard target
 /// that is shared by several conditional branches.
 ///
@@ -1511,7 +1586,7 @@ const MAX_SHARED_REGIONS: usize = 64;
 /// (a linear walk, a loop body, a block reached from an unbounded region):
 /// those keep the previous behaviour rather than risk a bogus copy.
 fn shared_region(
-    ctx: &StructureCtx,
+    ctx: &mut StructureCtx,
     target: Option<BlockIdx>,
     merge: Option<BlockIdx>,
 ) -> Option<Stmt> {
@@ -1531,7 +1606,13 @@ fn shared_region(
     if ctx.loops.iter().any(|l| l.header == target) {
         return None;
     }
-    ctx.shared_regions.get(&(target, merge)).cloned()
+    let region = ctx.shared_regions.get(&(target, merge))?;
+    let cost = region.node_count();
+    if cost > MAX_SHARED_REGION_STATEMENTS || ctx.cloned_statements + cost > MAX_CLONED_STATEMENTS {
+        return None;
+    }
+    ctx.cloned_statements += cost;
+    Some(region.clone())
 }
 
 /// Remember the Stmt tree the walk emitted for the `(target, merge)` region so
@@ -1545,7 +1626,10 @@ fn remember_region(
     let Some(target) = target else {
         return;
     };
-    if body.is_empty_seq() || ctx.shared_regions.len() >= MAX_SHARED_REGIONS {
+    if body.is_empty_seq()
+        || ctx.shared_regions.len() >= MAX_SHARED_REGIONS
+        || body.node_count() > MAX_SHARED_REGION_STATEMENTS
+    {
         return;
     }
     let _ = ctx
@@ -2407,6 +2491,23 @@ mod tests {
     use crate::cfg::Edge;
     use crate::decode::{Instruction, RegList};
     use crate::ssa::{SsaBlock, SsaInsn};
+
+    #[test]
+    fn node_count_walks_nested_statements() {
+        let leaf = Stmt::Return(None);
+        assert_eq!(leaf.node_count(), 1);
+
+        let guard = Stmt::If {
+            cond: Condition::Var(VarId::new(0, 0)),
+            then_body: Box::new(Stmt::Seq(vec![])),
+            else_body: Some(Box::new(Stmt::Seq(vec![Stmt::Break, leaf.clone()]))),
+        };
+        // If + empty then + else Seq + Break + Return.
+        assert_eq!(guard.node_count(), 5);
+
+        let nested = Stmt::Seq(vec![guard.clone(), Stmt::Seq(vec![guard])]);
+        assert_eq!(nested.node_count(), 1 + 5 + (1 + 5));
+    }
 
     fn empty_cfg_block(id: u32) -> BasicBlock {
         BasicBlock {

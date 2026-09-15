@@ -112,10 +112,23 @@ empty control-flow body):
 `unsupported` (the raw-smali fallback) is unchanged at 260 classes on `services.jar`:
 this patch removes the *silent* loss, not the classes the emitter declines. What is left
 is small and cosmetic: mostly an inverted `if (cond) { } else { body }` where the
-reference writes `if (!cond) { body }`, plus guard chains whose shared target is a
-switch-case arm.
+reference writes `if (!cond) { body }`, guard chains whose shared target is a
+switch-case arm, and paths whose copies ran into the per-method budget below.
 
-Safety: `cargo test` (954 tests — 940 unit + 14 integration/doc — including the
+A copy is only worth making while it stays small. A remembered region can itself
+contain a copy — a guard chain inside a loop reuses a region that was already built
+from earlier copies — so an unbounded reuse compounds with nesting depth.
+`shared_region` therefore charges every copy against a per-method budget (65,536
+statements) and `remember_region` stores no region larger than 4,096 statements.
+Before the bound, `services.jar`'s
+`com.android.server.display.DisplayPowerState$PhotonicModulator` structured to **2.27 GB**
+of Java in 103 s by repeatedly copying a region that contained copies of another one;
+with the bound it renders 821 KB in 0.5 s, and the empty-control-flow counts of both
+corpora above are unchanged. Exhausting the budget costs only the copies that would
+have followed — those paths keep the historical empty-body shape, never wrong code —
+so a method can never come out worse than before the patch.
+
+Safety: `cargo test` (955 tests — 941 unit + 14 integration/doc — including the
 structurer's tree-shape tests) passes;
 the two corpus sweeps above decompile every class of both archives without an error;
 `bench/quality_vs_reference.py` in ASC — which compares `rasc getclass` against the
