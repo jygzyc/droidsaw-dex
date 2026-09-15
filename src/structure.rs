@@ -1519,11 +1519,16 @@ fn shared_region(
     if !ctx.visited.contains(&target) {
         return None;
     }
-    if ctx
-        .loops
-        .iter()
-        .any(|l| l.header == target || l.body.contains(&target))
-    {
+    // A guard that targets a loop header is the `continue` shape, not a shared
+    // body: the header is not a bounded region and emitting a copy of it would
+    // re-test the loop instead of running an iteration body.
+    //
+    // A target *inside* a loop body is fine, and is how `if (a || b) { body }`
+    // inside a loop is lowered (`getA11yFeatureToTileMapInternal` in
+    // services.jar dropped the `put` from the `b` path): the copy is emitted in
+    // the same loop context as the region it copies, so `break`/`continue`
+    // inside it still bind to that loop.
+    if ctx.loops.iter().any(|l| l.header == target) {
         return None;
     }
     ctx.shared_regions.get(&(target, merge)).cloned()
