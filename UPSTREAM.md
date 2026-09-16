@@ -74,6 +74,21 @@ one-line reproducer). Gating the suppression on the inline render succeeding is 
 change to `classes.rs` (`EnumCtx::applies`), and it also covers the `super(name,
 ordinal)` strip in `maybe_strip_enum_super_call`.
 
+## 5. `new-instance` look-ahead ignores `invoke-direct/range`
+
+The look-ahead that pairs a `new-instance` with its constructor call (so the pair can be
+rendered as one `new T(args)` expression) tests the opcode with `== Opcode::InvokeDirect`.
+A construction whose receiver plus arguments need a dense register window is encoded as
+`invoke-direct/range`, which that test never matches, so the pair stays unmerged: the
+object is declared as a bare `new T()` — invalid Java whenever no zero-argument
+constructor exists — and the real construction becomes a discarded expression.
+`Lcom/xiaomi/push/r3;<clinit>` on `com.xiaomi.router` is the reproducer (a
+`ThreadPoolExecutor` with five arguments, one of them `long`, stored in a static field).
+`emit.rs` already handled the range form everywhere else, including the emit site that
+renders the paired expression; matching both opcodes in the look-ahead is the whole
+change, and `src/emit.rs` unit test
+`ctor_range_opcode_pairs_with_new_instance` fails without it.
+
 ## What we do meanwhile
 
 `vendor/droidsaw-dex` carries both changes as a patch (`PATCHES.md` documents each

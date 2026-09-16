@@ -36,7 +36,13 @@ crates.io instead of a sibling directory.
 
 `tests/`, `fuzz/`, `proofs/` and `examples/` are all retained from upstream. They are
 excluded from the published package, are harmless here, and keeping them is what makes
-rebasing onto the next release a no-op.
+rebasing onto the next release a no-op. One consequence of the published manifest is
+worth stating: it carries `autotests = false` and no `[[test]]` targets, and upstream's
+`tests/` expect the sibling `droidsaw-fixture-harness` crate that the normalized manifest
+drops. `cargo test` therefore runs the crate's unit tests (`src/**` `#[cfg(test)]`), not
+`tests/`; regression tests added on this branch belong in the unit-test modules (or, when
+the shape needs a compiled fixture, compile it at test time with `javac` + `d8` and skip
+cleanly when the toolchain is absent, as the constructor-pairing test below does).
 
 The published tarball's `.cargo_vcs_info.json` (a crates.io artifact recording the source
 revision) is not carried: this branch *is* the source, not a repackaged release.
@@ -128,8 +134,9 @@ corpora above are unchanged. Exhausting the budget costs only the copies that wo
 have followed — those paths keep the historical empty-body shape, never wrong code —
 so a method can never come out worse than before the patch.
 
-Safety: `cargo test` (955 tests — 941 unit + 14 integration/doc — including the
-structurer's tree-shape tests) passes;
+Safety: `cargo test` (942 unit tests — the run that mentions integration tests only
+happens in the upstream workspace, see §0 — including the structurer's tree-shape tests)
+passes;
 the two corpus sweeps above decompile every class of both archives without an error;
 `bench/quality_vs_reference.py` in ASC — which compares `rasc getclass` against the
 reference decompiler per class — reports, on the same fixture sample, flagged classes
@@ -209,11 +216,75 @@ public static CreditCard$Type valueOf(String v1) { ... }
 public static CreditCard$Type[] values() { ... }
 ```
 
-Measured effect: `cargo test` (955 tests) still passes; on the device corpus (1,080
+Measured effect: `cargo test` (942 unit tests) still passes; on the device corpus (1,080
 classes across five archives) `bench/quality_vs_reference.py` drops from 157 to 146
 flagged classes (method-set 129 -> 117) with no class regressing. Before this goes
 upstream the shape wants a byte-for-byte fixture in `tests/` so the branch that R8
 triggers here is pinned.
+
+## 7. `invoke-direct/range` pairs with its `new-instance`
+
+Emitting `new T(args)` requires pairing a `new-instance` with the `invoke-direct` that
+runs the constructor: the emitter looks ahead for the `<init>` call, folds it into the
+`new` expression, and records the receiver as inlined. That look-ahead matched one
+opcode:
+
+```rust
+if init_insn.insn.op == Opcode::InvokeDirect {
+```
+
+The range form of the same call was invisible to it. `Lcom/xiaomi/push/r3;<clinit>` is
+such a pair (receiver plus five argument words, one of them the `long` timeout):
+
+```
+new-instance v7, ThreadPoolExecutor;
+const/4 v1, 1
+const/4 v2, 1
+const-wide/16 v3, 15
+sget-object v5, TimeUnit.SECONDS
+new-instance v6, LinkedBlockingQueue; invoke-direct {v6}, <init>()V
+move-object v0, v7
+invoke-direct/range {v0 .. v6}, <init>(I I J TimeUnit$ BlockingQueue)V
+sput-object v7, r3.a
+```
+
+SSA coalesces the receiver copy, so the range call's first use *is* the `new-instance`'s
+`VarId`. Because the look-ahead only knew the 35c form, it never reached the call, the
+pair stayed unmerged, and the class came out as two statements — a bare `new T()` bound
+to the variable and a discarded `new T(args)` expression:
+
+```java
+java.util.concurrent.ThreadPoolExecutor v7_0 = new java.util.concurrent.ThreadPoolExecutor();
+new java.util.concurrent.ThreadPoolExecutor(1, 1, v3_3, v5_4, v6_5);
+a = v7_0;
+```
+
+`new ThreadPoolExecutor()` is not valid Java (no zero-argument constructor exists), and
+the field received an object that was never constructed while the real construction was
+thrown away. The fix matches both encodings
+(`Opcode::InvokeDirect | Opcode::InvokeDirectRange`); the emit site that renders the
+paired form (`insn.dst.is_none() && matches!(op, InvokeDirect | InvokeDirectRange)`)
+already handled the range case, so nothing else changed. The other look-aheads in the
+module already listed both opcodes; this was the one that did not.
+
+Measured effect: `Lcom/xiaomi/push/r3;<clinit>` now renders the construction as the
+initialiser of the variable that is stored:
+
+```java
+long v3_3 = 15L;
+java.util.concurrent.TimeUnit v5_4 = java.util.concurrent.TimeUnit.SECONDS;
+java.util.concurrent.LinkedBlockingQueue v6_5 = new java.util.concurrent.LinkedBlockingQueue();
+java.util.concurrent.ThreadPoolExecutor v7_0 = new java.util.concurrent.ThreadPoolExecutor(1, 1, v3_3, v5_4, v6_5);
+a = v7_0;
+```
+
+`cargo test` gains `emit::tests::ctor_range_opcode_pairs_with_new_instance`, which
+compiles a five-argument (one `long`) construction with `javac` + `d8` at test time,
+asserts the fixture really contains an `invoke-direct/range` (so the test cannot quietly
+cover the 35c path instead), and then requires that the constructed variable is the one
+stored in the field with no bare `new T()` anywhere. Reverting the one-line matcher makes
+it fail with the output above. ASC's acceptance scenario `ctor-invocation-pairing`
+(`tests/acceptance/scenarios.json`) pins the same defect against the real device APK.
 
 ## Safety
 

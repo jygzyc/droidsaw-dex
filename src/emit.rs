@@ -2558,6 +2558,23 @@ fn collect_inline_candidates(
                             // Skip pure value-producing statements between new-instance and
                             // <init> (e.g. StringConcat that builds constructor args).
                             //
+                            // Both encodings of the call count: `invoke-direct` and
+                            // `invoke-direct/range`. A range form is what the assembler
+                            // emits once the receiver plus its arguments need a dense
+                            // window (more than five argument registers, or a receiver
+                            // that has to be moved into the range base). `r3.<clinit>`
+                            // is such a pair:
+                            //   new-instance v7, ThreadPoolExecutor;
+                            //   ... 1, 1, 15L, TimeUnit.SECONDS, new LinkedBlockingQueue ...
+                            //   move-object v0, v7;
+                            //   invoke-direct/range {v0 .. v6} <init>(I I J TimeUnit; BlockingQueue;)
+                            //   sput-object v7, r3.a
+                            // SSA coalesces the receiver copy, so the range call uses the
+                            // new-instance's own VarId. Matching only the non-range opcode
+                            // leaves the pair unmerged: the object is declared as a bare
+                            // `new T()` (invalid Java — that constructor does not exist)
+                            // and the real construction becomes a discarded expression.
+                            //
                             // Receiver match: same VarId OR same reg with type-soundness
                             // guard (the invoke must be `<init>` on the new-instance's
                             // type). The reg-with-type-guard relaxation handles SSA
@@ -2571,7 +2588,10 @@ fn collect_inline_candidates(
                             };
                             for s in stmts.iter().skip(i + 1).take(15) {
                                 if let Stmt::Expr(init_insn) = s {
-                                    if init_insn.insn.op == Opcode::InvokeDirect {
+                                    if matches!(
+                                        init_insn.insn.op,
+                                        Opcode::InvokeDirect | Opcode::InvokeDirectRange
+                                    ) {
                                         let receiver = init_insn.uses.first();
                                         let same_var = receiver == Some(new_dst);
                                         let same_reg_and_init = !same_var
@@ -7518,4 +7538,148 @@ mod tests {
             "Array<String>",
         );
     }
+    /// `invoke-direct/range` must pair with its `new-instance` exactly like the
+    /// 35c `invoke-direct` form. The look-ahead below matched only
+    /// `Opcode::InvokeDirect`, so a construction whose receiver plus arguments
+    /// need a dense register window came out as two statements: a bare `new T()`
+    /// (often not valid Java at all) bound to the variable, plus a discarded
+    /// `new T(args)` expression. Compiles a real fixture here because the shape
+    /// is produced by register allocation, not by hand-written IR: receiver plus
+    /// five argument words (one `long`) forces the range form. Skips cleanly
+    /// without javac/d8.
+    #[test]
+    fn ctor_range_opcode_pairs_with_new_instance() {
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        fn resolve_javac() -> Option<PathBuf> {
+            if let Ok(home) = std::env::var("JAVA_HOME") {
+                let p = PathBuf::from(&home).join("bin").join("javac");
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+            let out = Command::new("which").arg("javac").output().ok()?;
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+        }
+
+        fn resolve_d8() -> Option<PathBuf> {
+            let android = std::env::var("ANDROID_HOME").ok()?;
+            let bt = PathBuf::from(android).join("build-tools");
+            let mut versions: Vec<PathBuf> = std::fs::read_dir(&bt)
+                .ok()?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort();
+            versions.reverse();
+            versions.into_iter().map(|v| v.join("d8")).find(|p| p.exists())
+        }
+
+        let (Some(javac), Some(d8)) = (resolve_javac(), resolve_d8()) else {
+            eprintln!("SKIP: ctor_range_opcode_pairs_with_new_instance (javac/d8 not found)");
+            return;
+        };
+
+        const SOURCE: &str = r#"
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+public class CtorRange {
+    static ThreadPoolExecutor field;
+
+    static {
+        field = new ThreadPoolExecutor(1, 1, 15L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<Runnable>());
+    }
 }
+"#;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let src_path = tmp.path().join("CtorRange.java");
+        std::fs::write(&src_path, SOURCE).expect("write source");
+        let classes_dir = tmp.path().join("classes");
+        std::fs::create_dir_all(&classes_dir).expect("mkdir classes");
+        assert!(
+            Command::new(&javac)
+                .args(["-d"])
+                .arg(&classes_dir)
+                .arg(&src_path)
+                .status()
+                .expect("javac spawn")
+                .success(),
+            "javac failed"
+        );
+        let dex_dir = tmp.path().join("dex");
+        std::fs::create_dir_all(&dex_dir).expect("mkdir dex");
+        let class_file = classes_dir.join("CtorRange.class");
+        assert!(class_file.exists(), "javac produced no class file");
+        assert!(
+            Command::new(&d8)
+                .args(["--min-api", "26", "--output"])
+                .arg(&dex_dir)
+                .arg(&class_file)
+                .status()
+                .expect("d8 spawn")
+                .success(),
+            "d8 failed"
+        );
+
+        let data = std::fs::read(dex_dir.join("classes.dex")).expect("read dex");
+        let dex = crate::parser::DexFile::parse(&data, None).expect("parse");
+
+        // The fixture must really exercise the range path, otherwise this test
+        // would silently cover the 35c path instead.
+        let class_def = crate::classes::classes_to_decompile(&dex)
+            .find(|(_, cd)| dex.get_type_descriptor(cd.class_idx).ok() == Some("LCtorRange;"))
+            .map(|(_, cd)| cd)
+            .expect("class in fixture");
+        let has_range = dex
+            .class_datas
+            .get(&class_def.class_data_off)
+            .map(|cd| {
+                cd.direct_methods
+                    .iter()
+                    .chain(cd.virtual_methods.iter())
+                    .any(|m| {
+                        crate::decode::parse_code_item(&data, m.code_off)
+                            .map(|code| {
+                                code.instructions
+                                    .iter()
+                                    .any(|i| i.op == crate::opcodes::Opcode::InvokeDirectRange)
+                            })
+                            .unwrap_or(false)
+                    })
+            })
+            .unwrap_or(false);
+        assert!(has_range, "fixture no longer compiles to invoke-direct/range");
+
+        let source = crate::classes::decompile_class(&dex, &data, class_def);
+
+        // Construction and store must be one expression over one variable.
+        let binding = source
+            .lines()
+            .find(|line| line.contains("= new java.util.concurrent.ThreadPoolExecutor(1, 1,"))
+            .unwrap_or_else(|| panic!("no bound construction in output:\n{source}"));
+        let variable = binding
+            .split('=')
+            .next()
+            .expect("left-hand side")
+            .split_whitespace()
+            .last()
+            .expect("variable name")
+            .to_string();
+        assert!(
+            source.contains(&format!("field = {variable};")),
+            "constructed instance is not the one stored in the field:\n{source}"
+        );
+        assert!(
+            !source.contains("new java.util.concurrent.ThreadPoolExecutor()"),
+            "bare no-argument construction survived (invalid Java):\n{source}"
+        );
+    }
+}
+
