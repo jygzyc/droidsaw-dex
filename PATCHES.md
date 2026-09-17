@@ -284,7 +284,7 @@ asserts the fixture really contains an `invoke-direct/range` (so the test cannot
 cover the 35c path instead), and then requires that the constructed variable is the one
 stored in the field with no bare `new T()` anywhere. Reverting the one-line matcher makes
 it fail with the output above. ASC's acceptance scenario `ctor-invocation-pairing`
-(`tests/acceptance/scenarios.json`) pins the same defect against the real device APK.
+(`bench/scenarios.py`) pins the same defect against the real device APK.
 
 ## Safety
 
