@@ -283,8 +283,7 @@ compiles a five-argument (one `long`) construction with `javac` + `d8` at test t
 asserts the fixture really contains an `invoke-direct/range` (so the test cannot quietly
 cover the 35c path instead), and then requires that the constructed variable is the one
 stored in the field with no bare `new T()` anywhere. Reverting the one-line matcher makes
-it fail with the output above. ASC's acceptance scenario `ctor-invocation-pairing`
-(`bench/scenarios.py`) pins the same defect against the real device APK.
+it fail with the output above. ASC's acceptance suite pinned the same defect against the real device APK.
 
 ## Safety
 
